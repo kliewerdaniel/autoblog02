@@ -217,7 +217,8 @@ class RSSIngestor:
                     ids=processed_ids
                 )
 
-                self.logger.info(f"Successfully ingested {total_chunks} chunks from {len(articles)} RSS articles")
+                self.logger.info(f"Successfully stored {len(processed_texts)} chunks in vector database")
+                self.logger.info(f"Successfully ingested {total_chunks} chunks from {len(articles)} RSS articles into knowledge base")
 
                 return {
                     "success": True,
@@ -471,16 +472,22 @@ class BlogGenerationService:
         self.publication_service = PublicationService()
         self.logger = logger
 
-    async def generate_from_feed_items(self, articles: List[ArticleData], dry_run: bool = False) -> Dict[str, Any]:
+    async def generate_from_feed_items(self, articles: List[ArticleData], dry_run: bool = False, has_new_articles: bool = True) -> Dict[str, Any]:
         """Generate blog post from RSS feed items."""
-        if not articles:
+        if not articles and has_new_articles:
             return {"error": "No articles provided"}
 
-        self.logger.info(f"Generating blog post from {len(articles)} RSS items")
+        if not articles and not has_new_articles:
+            self.logger.info("Generating blog post from existing knowledge")
+        else:
+            self.logger.info(f"Generating blog post from {len(articles)} RSS items")
 
         try:
-            # Create topic from articles
-            topic_prompt = await self.topic_generator.summarize_to_topic(articles)
+            # Create topic from articles or generate original content
+            if not has_new_articles:
+                topic_prompt = await self.topic_generator.generate_original_topic()
+            else:
+                topic_prompt = await self.topic_generator.summarize_to_topic(articles)
 
             spec_data = {
                 'topic': topic_prompt,
@@ -490,7 +497,8 @@ class BlogGenerationService:
                 'min_words': 1500,
                 'max_words': 5000,
                 'categories': ['News', 'Analysis', 'Current Events'],
-                'tags': ['news', 'trends', 'analysis', 'rss', 'synthesis']
+                'tags': ['news', 'trends', 'analysis', 'rss', 'synthesis'] if has_new_articles else ['original', 'analysis', 'deep-dive', 'thought-leadership'],
+                'has_new_articles': has_new_articles
             }
 
             if dry_run:
@@ -504,31 +512,15 @@ class BlogGenerationService:
             result = await self.orchestrator.generate_blog_post(topic_prompt, spec_data)
 
             if result.success and result.file_path:
-                # Read the generated content
-                with open(result.file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                # Extract title and content if it's frontmatter
-                try:
-                    post = frontmatter.loads(content)
-                    title = post.get('title', topic_prompt[:50])
-                    body = post.content
-                    metadata = dict(post.metadata)
-                except:
-                    # Fallback: use filename or topic as title
-                    title = topic_prompt[:50]
-                    body = content
-                    metadata = {}
-
-                # Auto-publish the post
-                publish_result = self.publication_service.publish_post(title, body, metadata)
+                # The agent ingestor already saves the file to content/blog, which is the publication location
+                self.logger.info(f"Blog post already published by agent workflow: {result.file_path}")
 
                 return {
                     "success": True,
                     "file_path": result.file_path,
-                    "published_path": publish_result.get("filepath"),
+                    "published_path": result.file_path,  # Same location
                     "iterations": result.iterations,
-                    "published": publish_result.get("success", False)
+                    "published": True  # Already published by agent
                 }
             else:
                 return {
@@ -590,6 +582,35 @@ Please respond with:
             self.logger.error(f"Error generating topic: {e}")
             return "News Summary and Blog Topic"
 
+    async def generate_original_topic(self) -> str:
+        """Generate an original blog topic when no new articles are available."""
+        prompt = """You are a blog strategist tasked with creating compelling and valuable content based on existing knowledge in a news/analysis blog. Since no new articles are available right now, please:
+
+1. Reflect on trending topics and evolving narratives in current events, technology, culture, or society
+2. Identify a specific angle or deep-dive topic that would be engaging for readers
+3. Create an original, insightful perspective that offers value through analysis or foresight
+4. Suggest a detailed topic that could be expanded into a comprehensive blog post
+
+Please provide:
+- The suggested original blog post topic
+- A brief rationale for why this topic would be valuable
+- A detailed writing prompt for the AI blog generator, focusing on creating insightful analysis or forward-looking perspectives
+
+Topic should be suitable for a 1500-5000 word blog post with technical depth and informative tone."""
+
+        self.logger.info("Generating original blog topic from existing knowledge...")
+
+        try:
+            result = await self.ollama_client.generate(
+                prompt,
+                system_prompt="You are a creative strategist who generates original, valuable blog content based on patterns in existing knowledge and current trends.",
+                temperature=0.8
+            )
+            return result if result else "Emerging Trends and Future Insights"
+        except Exception as e:
+            self.logger.error(f"Error generating original topic: {e}")
+            return "Emerging Trends and Future Insights"
+
 
 class ContinuousDaemon:
     """Main daemon class for continuous blog generation."""
@@ -626,6 +647,10 @@ class ContinuousDaemon:
             max_instances=1
         )
 
+        # Perform initial check immediately
+        self.logger.info("Performing initial RSS feed check...")
+        self._check_feeds_job()
+
         self.logger.info("Daemon started. Press Ctrl+C to stop.")
 
         try:
@@ -649,7 +674,9 @@ class ContinuousDaemon:
     def _check_feeds_job(self):
         """Scheduled job to check for new RSS content."""
         try:
+            self.logger.info("Starting scheduled RSS feed check cycle...")
             asyncio.run(self._check_feeds_async())
+            self.logger.info("Completed scheduled RSS feed check cycle - daemon will check again in next interval")
         except Exception as e:
             self.logger.error(f"Feed check job failed: {e}")
 
@@ -670,13 +697,20 @@ class ContinuousDaemon:
                     self.logger.error(f"Ingestion failed: {ingestion_result['error']}")
                     return
 
-                # Enqueue generation task
+                # Enqueue generation task with new articles
                 self.task_queue.enqueue('generate_from_feed', {
                     'articles': [article.__dict__ for article in new_articles],
-                    'ingestion_result': ingestion_result
+                    'ingestion_result': ingestion_result,
+                    'has_new_articles': True
                 })
             else:
-                self.logger.info("No new articles found")
+                self.logger.info("No new articles found - generating post from existing knowledge")
+                # Enqueue generation task with empty articles (will generate from existing knowledge)
+                self.task_queue.enqueue('generate_from_feed', {
+                    'articles': [],
+                    'ingestion_result': None,
+                    'has_new_articles': False
+                })
 
         except Exception as e:
             self.logger.error(f"Feed check failed: {e}")
@@ -700,17 +734,25 @@ class ContinuousDaemon:
             data = task['data']
 
             if task_type == 'generate_from_feed':
-                self.logger.info(f"Processing generation task for {len(data['articles'])} articles")
+                has_new_articles = data.get('has_new_articles', True)
+                self.logger.info(f"Processing generation task for {len(data['articles'])} articles (has_new_articles: {has_new_articles})")
 
                 # Convert back to ArticleData objects
                 articles = [ArticleData(**article) for article in data['articles']]
 
-                result = await self.blog_service.generate_from_feed_items(articles)
+                result = await self.blog_service.generate_from_feed_items(articles, has_new_articles=has_new_articles)
 
                 if result.get('success'):
                     self.logger.info(f"Blog generation successful: {result.get('file_path')}")
                     if result.get('published_path'):
                         self.logger.info(f"Blog post published to: {result.get('published_path')}")
+
+                    # Enqueue another generation task to keep generating more blog posts
+                    self.task_queue.enqueue('generate_from_feed', {
+                        'articles': [],
+                        'ingestion_result': None,
+                        'has_new_articles': False
+                    })
                 else:
                     self.logger.error(f"Blog generation failed: {result.get('error')}")
 
@@ -796,4 +838,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-</content>
